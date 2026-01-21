@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>eindopdracht</title>
+  <style>
+    /* Pagina: centreer alles */
+    body{
+      margin:0;
+      background:#111;
+      display:flex;
+      justify-content:center;
+      align-items:center;
+      height:100vh;
+    }
+
+    #wrap{ position:relative; }
+
+    /* Score linksboven */
+    #hud{
+      position:absolute;
+      left:14px;
+      top:14px;
+      color:white;
+      font:20px Arial, sans-serif;
+      user-select:none;
+      text-shadow:0 2px 6px rgba(0,0,0,0.6);
+    }
+
+    /* Boodschap bovenin (RAAK/MIS) */
+    #msg{
+      position:absolute;
+      left:50%;
+      top:14px;
+      transform:translateX(-50%);
+      padding:8px 14px;
+      border-radius:10px;
+      font:18px Arial, sans-serif;
+      color:#fff;
+      user-select:none;
+      text-shadow:0 2px 6px rgba(0,0,0,0.6);
+      display:none;           /* wordt zichtbaar via JS */
+      pointer-events:none;
+    }
+    #msg.good{ background:rgba(0,150,0,0.75); } /* groen */
+    #msg.bad { background:rgba(200,0,0,0.75); } /* rood */
+
+    canvas{ border:1px solid rgba(255,255,255,0.12); }
+  </style>
+</head>
+
+<body>
+<div id="wrap">
+  <div id="hud">Score: 0</div>
+  <div id="msg"></div>
+  <canvas id="myCanvas" width="640" height="480"></canvas>
+</div>
+
+<script type="text/javascript">
+  //Bestanden (OBJ modellen + texture)
+  const FILE_HOOP = "hoop3.obj";
+  const FILE_BALL = "bal.obj";
+  const HOOP_TEXTURE = "hoopTexture.jpg";
+
+  //Hoop beweging
+  const HOOP_MOVE_AMPLITUDE = 0.9; 
+  const HOOP_MOVE_SPEED = 1.2;     
+  const HOOP_BASE_Y = -1.0;        
+  const HOOP_BASE_Z = -2.8;        
+
+  //Bal schot (parabool)
+  const BALL_START = { x: -0.7, y: -0.4, z: -1.0 };
+  const SHOT_DURATION = 1.25; 
+  const SHOT_DZ = -1.6;       
+  const SHOT_DX = 0.0;        
+  const ARC_HEIGHT = 1.4;     
+  const END_BELOW_RIM = 0.25; 
+
+  // score instellingen 
+  const RIM_OFFSET = { x: -0.5, y: 0.6, z: 0.2 }; 
+  const RIM_RADIUS = 0.5;                          
+  const BALL_RADIUS = 0.05;                        
+
+  //OBJ-bestand als tekst inladen (sync)
+  function loadTextSync(url) {
+    let text = "";
+    const req = new XMLHttpRequest();
+    req.onload = function () { text = this.responseText; };
+    req.open("GET", url, false);  // sync request: wacht tot klaar
+    req.send();
+    return text;
+  }
+
+  //OBJ parser (v, vn, vt, f) ,triangles
+  function parseOBJ(text, withUV) {
+    let pos = [];
+    let texCoord = [];
+    let normal = [];
+    let vertices = [];
+
+    const lines = text.split("\n");
+
+    lines.forEach((line) => {
+      if (line === "" || line.startsWith("#")) return;
+
+      const parts = line.trim().split(/\s+/);
+      switch (parts[0]) {
+        case "v":   // vertex positie
+          pos.push(parts.slice(1).map(parseFloat));
+          break;
+
+        case "vn":  // vertex normal (voor belichting)
+          normal.push(parts.slice(1).map(parseFloat));
+          break;
+
+        case "vt":  // texture coords (u,v)
+          texCoord.push(parts.slice(1, 3).map(parseFloat));
+          break;
+
+        case "f": { // face: maakt triangles (fan)
+          let indexList = parts.slice(1).map(v => v.split("/"));
+
+          let vertList = indexList.map((idx) => {
+            const vi = parseInt(idx[0], 10) - 1;
+            const ti = (idx[1] && idx[1] !== "") ? (parseInt(idx[1], 10) - 1) : -1;
+            const ni = (idx[2] && idx[2] !== "") ? (parseInt(idx[2], 10) - 1) : -1;
+
+            const p = pos[vi] || [0,0,0];
+            const n = (ni >= 0 && normal[ni]) ? normal[ni] : [0,1,0];
+            const uv = (ti >= 0 && texCoord[ti]) ? texCoord[ti] : [0,0];
+
+            return withUV ? p.concat(n, uv) : p.concat(n);
+          });
+
+          for (let j = 1; j < vertList.length - 1; j++) {
+            vertices.push(...vertList[0]);
+            vertices.push(...vertList[j]);
+            vertices.push(...vertList[j + 1]);
+          }
+          break;
+        }
+      }
+    });
+
+    return vertices;
+  }
+
+  //WebGL2 opstarten
+  const canvas = document.getElementById("myCanvas");
+  const gl = canvas.getContext("webgl2");
+  if (!gl) {
+    alert("WebGL2 not supported");
+    throw new Error("WebGL2 not supported");
+  }
+
+  // vertex shader
+  const vs = gl.createShader(gl.VERTEX_SHADER);
+  const vsSource = `#version 300 es
+    in vec3 aPos;
+    in vec3 aNormal;
+    in vec2 aTexCoord;
+
+    out vec3 normal;
+    out vec3 fragPos;
+    out vec2 vTexCoord;
+
+    uniform mat4 projection;
+    uniform mat4 translation;
+    uniform mat4 fixedRotation;
+
+    void main() {
+      // fixedRotation (camera-hoek) en translation (positie)
+      gl_Position = projection * translation * fixedRotation * vec4(aPos, 1.0);
+
+      // Normal en fragPos zijn nodig voor belichting
+      normal = mat3(fixedRotation) * aNormal;
+      fragPos = vec3(translation * fixedRotation * vec4(aPos, 1.0));
+
+      // coords voor texture mapping
+      vTexCoord = aTexCoord;
+    }`;
+  gl.shaderSource(vs, vsSource);
+  gl.compileShader(vs);
+  if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(vs));
+  }
+
+  // fragment shader
+  const fs = gl.createShader(gl.FRAGMENT_SHADER);
+  const fsSource = `#version 300 es
+    precision mediump float;
+
+    in vec3 normal;
+    in vec3 fragPos;
+    in vec2 vTexCoord;
+
+    vec3 lightPos = vec3(1.0, -2.0, -3.0);
+
+    uniform vec4 uColor;         // kleur voor de bal
+    uniform sampler2D uTexture;  // texture voor de hoop
+    uniform int uUseTexture;     // 1=texture, 0=kleur
+
+    out vec4 fragColor;
+
+    void main() {
+      // Basis lichtberekening (ambient + diffuse + specular)
+      vec3 n = normalize(normal);
+      vec3 l = normalize(lightPos - fragPos);
+      vec3 r = reflect(-l, n);
+      vec3 v = normalize(fragPos);
+
+      float ambient = 0.2;
+      float diffuse = 0.5 * max(0.0, dot(n, l));
+      float specular = 0.5 * pow(max(0.0, dot(v, r)), 32.0);
+
+      // Kies texture of vaste kleur
+      vec4 baseColor = (uUseTexture == 1) ? texture(uTexture, vTexCoord) : uColor;
+
+      fragColor = baseColor;
+      fragColor.rgb *= (ambient + diffuse + specular);
+    }`;
+  gl.shaderSource(fs, fsSource);
+  gl.compileShader(fs);
+  if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(fs));
+  }
+
+  //shader programma
+  const program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
+  gl.useProgram(program);
+
+  //shader locaties 
+  const posLocation = gl.getAttribLocation(program, "aPos");
+  const normalLocation = gl.getAttribLocation(program, "aNormal");
+  const texCoordLocation = gl.getAttribLocation(program, "aTexCoord");
+
+  const projectionLocation = gl.getUniformLocation(program, "projection");
+  const translationLocation = gl.getUniformLocation(program, "translation");
+  const fixedRotationLocation = gl.getUniformLocation(program, "fixedRotation");
+
+  const colorLocation = gl.getUniformLocation(program, "uColor");
+  const useTextureLocation = gl.getUniformLocation(program, "uUseTexture");
+  const textureSamplerLocation = gl.getUniformLocation(program, "uTexture");
+
+  //modellen laden en buffers maken
+  const hoopText = loadTextSync(FILE_HOOP);
+  const ballText = loadTextSync(FILE_BALL);
+
+  const hoopVertices = new Float32Array(parseOBJ(hoopText, true));  
+  const hoopVertexCount = hoopVertices.length / 8;
+
+  const ballVertices = new Float32Array(parseOBJ(ballText, false));  
+  const ballVertexCount = ballVertices.length / 6;
+
+  const hoopBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, hoopBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, hoopVertices, gl.STATIC_DRAW);
+
+  const ballBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, ballBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, ballVertices, gl.STATIC_DRAW);
+
+  // Vertel WebGL hoe de data in de buffers is opgebouwd
+  function setAttributesForHoopBuffer() {
+    // 8 floats per vertex (32 bytes)
+    gl.enableVertexAttribArray(posLocation);
+    gl.vertexAttribPointer(posLocation, 3, gl.FLOAT, false, 32, 0);
+    gl.enableVertexAttribArray(normalLocation);
+    gl.vertexAttribPointer(normalLocation, 3, gl.FLOAT, false, 32, 12);
+    gl.enableVertexAttribArray(texCoordLocation);
+    gl.vertexAttribPointer(texCoordLocation, 2, gl.FLOAT, false, 32, 24);
+  }
+
+  function setAttributesForBallBuffer() {
+    // 6 floats per vertex (24 bytes)
+    gl.enableVertexAttribArray(posLocation);
+    gl.vertexAttribPointer(posLocation, 3, gl.FLOAT, false, 24, 0);
+    gl.enableVertexAttribArray(normalLocation);
+    gl.vertexAttribPointer(normalLocation, 3, gl.FLOAT, false, 24, 12);
+    gl.disableVertexAttribArray(texCoordLocation);
+    gl.vertexAttrib2f(texCoordLocation, 0.0, 0.0);
+  }
+
+  //texture voor de hoop laden
+  const hoopTexture = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, hoopTexture);
+  // dummy pixel zodat texture meteen geldig is
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+    new Uint8Array([200, 200, 200, 255])
+  );
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  //texture unit 0 koppelen aan uTexture
+  gl.uniform1i(textureSamplerLocation, 0);
+  //fbeelding laden
+  const img = new Image();
+  img.src = HOOP_TEXTURE;
+  img.addEventListener("load", () => {
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, hoopTexture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+  });
+
+  //render instellingen + matrices
+  gl.clearColor(0.1, 0.1, 0.1, 1);
+  gl.enable(gl.DEPTH_TEST);
+  // vierkant viewport in het midden
+  gl.viewport((gl.canvas.width - gl.canvas.height) / 2, 0, gl.canvas.height, gl.canvas.height);
+  // simpele projection matrix
+  const projection = new Float32Array([
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, -1, -1,
+    0, 0, -1, 0
+  ]);
+  gl.uniformMatrix4fv(projectionLocation, false, projection);
+
+  // vaste rotatie (camera-hoek)
+  const c = Math.cos(Math.PI / 6);
+  const s = Math.sin(Math.PI / 6);
+  const fixedRotation = new Float32Array([
+    1,  0, 0, 0,
+    0,  c, s, 0,
+    0, -s, c, 0,
+    0,  0, 0, 1
+  ]);
+  gl.uniformMatrix4fv(fixedRotationLocation, false, fixedRotation);
+
+  //overlay melding
+  const hud = document.getElementById("hud");
+  const msg = document.getElementById("msg");
+  let msgTimer = null;
+
+  function showMsg(text, kind) { // kind: good / bad
+    msg.textContent = text;
+    msg.classList.remove("good", "bad");
+    msg.classList.add(kind);
+    msg.style.display = "block";
+    if (msgTimer) clearTimeout(msgTimer);
+    msgTimer = setTimeout(() => { msg.style.display = "none"; }, 650);
+  }
+  //Game state (bal en score)
+  let score = 0;
+  let scoredThisShot = false;
+
+  const ball = {
+    active: false,   // is er nu een schot bezig?
+    startTime: 0,    // wanneer begon het schot?
+    start: {...BALL_START},
+    pos:   {...BALL_START}
+  };
+
+  //spatie start een nieuw schot
+  const startTime = Date.now();
+  document.addEventListener("keydown", (e) => {
+    if (e.code !== "Space") return;
+    if (e.repeat) return;
+    const t = 0.001 * (Date.now() - startTime);
+    // reset bal
+    ball.start = {...BALL_START};
+    ball.pos   = {...BALL_START};
+    // start schot
+    ball.startTime = t;
+    ball.active = true;
+    scoredThisShot = false;
+    msg.style.display = "none";
+  });
+
+  //alles tekenen + bal beweging + score check
+  function drawScene(t) {
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    // hoop positie sinus links-rechts
+    const hoopX = HOOP_MOVE_AMPLITUDE * Math.sin(HOOP_MOVE_SPEED * t);
+    const hoopBase = { x: hoopX, y: HOOP_BASE_Y, z: HOOP_BASE_Z };
+
+    // ring voor score berekening
+    const rimCenter = {
+      x: hoopBase.x + RIM_OFFSET.x,
+      y: hoopBase.y + RIM_OFFSET.y,
+      z: hoopBase.z + RIM_OFFSET.z
+    };
+
+    // hoop texture
+    gl.bindBuffer(gl.ARRAY_BUFFER, hoopBuffer);
+    setAttributesForHoopBuffer();
+
+    const hoopTranslation = new Float32Array([
+      1, 0, 0, 0,
+      0, 1, 0, 0,
+      0, 0, 1, 0,
+      hoopBase.x, hoopBase.y, hoopBase.z, 1
+    ]);
+    gl.uniformMatrix4fv(translationLocation, false, hoopTranslation);
+
+    gl.uniform1i(useTextureLocation, 1);       // texture aan
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, hoopTexture);
+
+    gl.drawArrays(gl.TRIANGLES, 0, hoopVertexCount);
+
+    // bal update  + score check
+    if (ball.active) {
+      const u = (t - ball.startTime) / SHOT_DURATION;    //schottijd
+      const s01 = Math.max(0, Math.min(1, u));           //waarde tussen 0 en 1
+
+      const beforeZ = ball.pos.z;                        // voor plane-cross check
+
+      // x en z gaan lineair
+      ball.pos.x = ball.start.x + SHOT_DX * s01;
+      ball.pos.z = ball.start.z + SHOT_DZ * s01;
+
+      //y: lineaire basis + extra boog (parabool)
+      const endY = rimCenter.y - END_BELOW_RIM;
+      const baseY = ball.start.y + (endY - ball.start.y) * s01;
+      const arc = ARC_HEIGHT * 4.0 * s01 * (1.0 - s01);
+      ball.pos.y = baseY + arc;
+
+      //Score als de bal het ring-vlak (z) kruist en binnen de cirkel valt
+      if (!scoredThisShot) {
+        const prevDz = beforeZ - rimCenter.z;
+        const currDz = ball.pos.z - rimCenter.z;
+
+        const crossedPlane =
+          (prevDz > 0 && currDz <= 0) ||
+          (prevDz < 0 && currDz >= 0);
+
+        if (crossedPlane) {
+          const dx = ball.pos.x - rimCenter.x;
+          const dy = ball.pos.y - rimCenter.y;
+          const distXY = Math.sqrt(dx*dx + dy*dy);
+
+          const fitsThrough = distXY <= (RIM_RADIUS - BALL_RADIUS);
+          if (fitsThrough) {
+            score += 1;
+            scoredThisShot = true;
+            hud.textContent = "Score: " + score;
+            showMsg("RAAK!", "good");
+          }
+        }
+      }
+
+      // Schot klaar ,als geen score, dan MIS
+      if (u >= 1.0) {
+        ball.active = false;
+        if (!scoredThisShot) showMsg("MIS!", "bad");
+      }
+    }
+
+    //kleur bal tekenen
+    gl.bindBuffer(gl.ARRAY_BUFFER, ballBuffer);
+    setAttributesForBallBuffer();
+
+    const ballTranslation = new Float32Array([
+      1, 0, 0, 0,
+      0, 1, 0, 0,
+      0, 0, 1, 0,
+      ball.pos.x, ball.pos.y, ball.pos.z, 1
+    ]);
+    gl.uniformMatrix4fv(translationLocation, false, ballTranslation);
+
+    gl.uniform1i(useTextureLocation, 0);                 // texture uit
+    gl.uniform4f(colorLocation, 1.0, 0.5, 0.1, 1.0);     // oranje
+
+    gl.drawArrays(gl.TRIANGLES, 0, ballVertexCount);
+  }
+ 
+  function draw() {
+    const t = 0.001 * (Date.now() - startTime);
+    drawScene(t);
+  }
+  setInterval(draw, 25);  
+</script>
+</body>
+</html>
